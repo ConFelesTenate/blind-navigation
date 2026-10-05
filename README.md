@@ -1,4 +1,4 @@
-# Streamlit Pedestrian Nav (`streamlit-pedestrian-nav`) 🚶🇻🇳
+# Streamlit Pedestrian Navigation
 
 Thư viện hệ thống dẫn đường người đi bộ tích hợp giọng nói tiếng Việt và nhận diện đèn giao thông thời gian thực dành cho người khiếm thị.
 
