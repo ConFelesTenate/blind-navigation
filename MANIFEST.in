@@ -1,0 +1,3 @@
+recursive-include pedestrian_nav/models *.pt
+recursive-include pedestrian_nav/templates *.html
+recursive-include pedestrian_nav/speech_component *.html

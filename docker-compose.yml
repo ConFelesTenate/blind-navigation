@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: pedestrian_osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osrm-data:/data
+    command: osrm-routed --algorithm mld /data/vietnam-latest.osrm
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: pedestrian_nav_app
+    ports:
+      - "8501:8501" # Streamlit app
+      - "5001:5001" # Navigation HTTP backend
+    environment:
+      - OSRM_URL=http://osrm:5000
+    depends_on:
+      - osrm

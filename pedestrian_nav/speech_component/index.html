@@ -1,0 +1,38 @@
+
+<!DOCTYPE html>
+<html>
+<head><style>body { margin: 0; padding: 0; font-family: sans-serif; text-align: center; }</style></head>
+<body>
+    <div style="padding: 5px;">
+        <button id="micBtn" onclick="startRecognition()" style="padding: 12px 24px; font-size: 16px; font-weight: bold; border-radius: 8px; border: none; background-color: #FF4B4B; color: white; cursor: pointer;">
+            🎤 Nhấn vào đây để nói điểm đến
+        </button>
+        <p id="status" style="margin-top: 8px; font-size: 14px; color: #888;"></p>
+    </div>
+    <script>
+    function sendMessage(type, data) {
+        window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+    }
+    sendMessage("streamlit:componentReady", { apiVersion: 1 });
+    sendMessage("streamlit:setFrameHeight", { height: 100 });
+
+    function startRecognition() {
+        var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) { alert("Trình duyệt không hỗ trợ Web Speech API."); return; }
+        var recognition = new SpeechRecognition();
+        recognition.lang = "vi-VN";
+        recognition.interimResults = false;
+        document.getElementById('status').innerText = "Đang lắng nghe...";
+        recognition.onresult = function(event) {
+            var transcript = event.results[0][0].transcript;
+            document.getElementById('status').innerText = "Đã nhận diện: " + transcript;
+            sendMessage("streamlit:setComponentValue", { value: transcript });
+        };
+        recognition.onerror = function(event) {
+            document.getElementById('status').innerText = "Lỗi nhận diện: " + event.error;
+        };
+        recognition.start();
+    }
+    </script>
+</body>
+</html>

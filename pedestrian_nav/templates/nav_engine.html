@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .nav-box { 
+            background: #1e1e1e; color: #ffffff; padding: 14px; 
+            border-radius: 8px; font-family: sans-serif; text-align: center; 
+            margin-top: 5px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+        }
+        .status-text { font-size: 17px; font-weight: bold; color: #00E676; margin-bottom: 6px; }
+        .light-text { font-size: 16px; font-weight: bold; color: #FF5252; margin-bottom: 6px; }
+        .heading-text { font-size: 14px; color: #FFD54F; margin-bottom: 6px; }
+        .dist-text { font-size: 14px; color: #B0BEC5; }
+        .btn-toggle { 
+            background-color: #FF4B4B; color: white; border: none; 
+            padding: 10px 18px; font-size: 14px; font-weight: bold; 
+            border-radius: 6px; cursor: pointer; margin-top: 10px; 
+        }
+    </style>
+</head>
+<body>
+    <div class="nav-box">
+        <div id="navInstruction" class="status-text">📡 Đang kết nối La Bàn & GPS...</div>
+        <div id="trafficLightStatus" class="light-text">🚦 Đang mở camera nhận diện đèn...</div>
+        <div id="compassHeading" class="heading-text">Hướng bạn đang nhìn: --°</div>
+        <div id="navDistance" class="dist-text">Đang chờ vị trí GPS...</div>
+        <button id="btnToggle" class="btn-toggle" onclick="toggleNavigation()">🛑 Tắt Voice Dẫn Đường</button>
+    </div>
+
+    <video id="mobileCam" autoplay playsinline style="display:none;"></video>
+    <canvas id="camCanvas" width="416" height="416" style="display:none;"></canvas>
+
+    <script>
+        let waypoints = null; // __WAYPOINTS_JSON__
+        const destLat = 0.0;  // __DEST_LAT__
+        const destLng = 0.0;  // __DEST_LNG__
+        const startLat = 0.0; // __START_LAT__
+        const startLng = 0.0; // __START_LNG__
+        const backendApiUrl = ""; // __BACKEND_API_URL__
+
+        function getApiBaseUrl() {
+            if (backendApiUrl && backendApiUrl.trim() !== "") {
+                return backendApiUrl.replace(/\/$/, "");
+            }
+            const host = window.location.hostname || "localhost";
+            const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+            return `${protocol}//${host}:5001`;
+        }
+        
+        let targetIdx = (waypoints && waypoints.length > 1) ? 1 : 0;
+        let navActive = true;
+        let watchId = null;
+        let isRecalculating = false;
+        let offRouteCount = 0;
+
+        // --- COMPASS & BEARING SMOOTHING ---
+        let smoothedHeading = null;
+        let lastDisplayedHeading = null;
+        let lastValidBearing = null;
+        const HEADING_DEADBAND_DEG = 2.0;
+
+        // --- DETECTION THROTTLING & COOLDOWNS ---
+        let isDetecting = false;
+        let lastFrameTime = 0;
+        const DETECTION_INTERVAL_MS = 400; // Frame capture rate ~2.5 FPS
+        
+        let lastSpokenLightStatus = null;
+        let lastStopLightSpokenTime = 0;
+        const STOP_LIGHT_COOLDOWN_MS = 15000;
+
+        const OFF_ROUTE_TOLERANCE_METERS = 35;
+        const OFF_ROUTE_TRIGGER_SAMPLES = 3;
+
+        const translationMap = {
+            "left": "rẽ trái", "right": "rẽ phải", "slight left": "chếch sang trái", "slight right": "chếch sang phải",
+            "sharp left": "rẽ ngoặt sang trái", "sharp right": "rẽ ngoặt sang phải", "straight": "đi thẳng tiếp", "uturn": "quay đầu"
+        };
+
+        function triggerHaptic(pattern) {
+            if ("vibrate" in navigator) {
+                try { navigator.vibrate(pattern); } catch (e) {}
+            }
+        }
+
+        // --- PRIORITY QUEUED SPEECH SYSTEM ---
+        let speechQueue = [];
+        let isSpeaking = false;
+        window.currentUtterance = null;
+
+        function processSpeechQueue() {
+            if (!navActive || speechQueue.length === 0 || isSpeaking) return;
+
+            isSpeaking = true;
+            const item = speechQueue.shift();
+            
+            try {
+                const u = new SpeechSynthesisUtterance(item.text);
+                u.lang = "vi-VN";
+                u.rate = 0.95;
+                window.currentUtterance = u;
+
+                u.onend = () => {
+                    isSpeaking = false;
+                    window.currentUtterance = null;
+                    processSpeechQueue();
+                };
+                u.onerror = () => {
+                    isSpeaking = false;
+                    window.currentUtterance = null;
+                    processSpeechQueue();
+                };
+                window.speechSynthesis.speak(u);
+            } catch(e) {
+                isSpeaking = false;
+                window.currentUtterance = null;
+                processSpeechQueue();
+            }
+        }
+
+        function speak(text, priority = 'NORMAL') {
+            if (!('speechSynthesis' in window) || !navActive) return;
+
+            if (priority === 'HIGH') {
+                speechQueue.unshift({ text: text, priority: 'HIGH' });
+                if (isSpeaking && window.currentUtterance) {
+                    try { window.speechSynthesis.cancel(); } catch(e) {}
+                    isSpeaking = false;
+                }
+            } else {
+                if (!speechQueue.some(item => item.text === text)) {
+                    speechQueue.push({ text: text, priority: 'NORMAL' });
+                }
+            }
+
+            processSpeechQueue();
+        }
+
+        function autoStartNavigation() {
+            const unlockAudio = () => {
+                if ('speechSynthesis' in window) {
+                    window.speechSynthesis.resume();
+                }
+                document.removeEventListener('click', unlockAudio);
+                document.removeEventListener('touchstart', unlockAudio);
+            };
+            document.addEventListener('click', unlockAudio);
+            document.addEventListener('touchstart', unlockAudio);
+
+            const initialTurn = (waypoints && waypoints.length > 0) ? waypoints[0].speech : "";
+            const startPhrase = initialTurn ? `Bắt đầu dẫn đường. ${initialTurn}` : "Bắt đầu dẫn đường.";
+            
+            speak(startPhrase, 'NORMAL');
+            announcedSegment = true;
+            triggerHaptic([200, 100, 200]);
+
+            setupCompass();
+            startCameraDetection();
+
+            if (startLat && startLng && startLat !== 0.0) {
+                processPosition({ coords: { latitude: startLat, longitude: startLng } });
+            }
+
+            if ("geolocation" in navigator) {
+                watchId = navigator.geolocation.watchPosition(
+                    processPosition, 
+                    e => { document.getElementById("navInstruction").innerText = "⚠️ Lỗi GPS: " + e.message; }, 
+                    { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+                );
+            }
+        }
+
+        function capitalize(str) {
+            if (!str) return "";
+            return str.charAt(0).toUpperCase() + str.slice(1);
+        }
+
+        function getHaversineDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371e3, φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+            const a = Math.sin((lat2-lat1)*Math.PI/360)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin((lon2-lon1)*Math.PI/360)**2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        }
+
+        function getBearing(lat1, lon1, lat2, lon2) {
+            if (getHaversineDistance(lat1, lon1, lat2, lon2) < 2) {
+                return lastValidBearing !== null ? lastValidBearing : 0;
+            }
+            const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+            const Δλ = (lon2 - lon1) * Math.PI / 180;
+            const y = Math.sin(Δλ) * Math.cos(φ2);
+            const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+            lastValidBearing = (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+            return lastValidBearing;
+        }
+
+        function pDistance(pLat, pLng, aLat, aLng, bLat, bLng) {
+            const deg2rad = Math.PI / 180, cosLat = Math.cos((aLat + bLat) / 2 * deg2rad), R = 6371000;
+            const bx = (bLng - aLng) * deg2rad * R * cosLat, by = (bLat - aLat) * deg2rad * R;
+            const px = (pLng - aLng) * deg2rad * R * cosLat, py = (pLat - aLat) * deg2rad * R;
+            const lenSq = bx * bx + by * by;
+            if (lenSq === 0) return Math.sqrt(px * px + py * py);
+            let t = Math.max(0, Math.min(1, (px * bx + py * by) / lenSq));
+            return Math.sqrt((px - t * bx)**2 + (py - t * by)**2);
+        }
+
+        function calculateW3CCompassHeading(alpha, beta, gamma) {
+            const deg2rad = Math.PI / 180;
+            const alphaRad = alpha * deg2rad;
+            const betaRad = beta * deg2rad;
+            const gammaRad = gamma * deg2rad;
+
+            const cA = Math.cos(alphaRad), sA = Math.sin(alphaRad);
+            const cB = Math.cos(betaRad), sB = Math.sin(betaRad);
+            const cG = Math.cos(gammaRad), sG = Math.sin(gammaRad);
+
+            const rA = -cA * sG - sA * sB * cG;
+            const rB = -sA * sG + cA * sB * cG;
+
+            let compassHeading = Math.atan2(rA, rB) * (180 / Math.PI);
+            if (compassHeading < 0) compassHeading += 360;
+            return compassHeading;
+        }
+
+        function smoothHeadingAngle(current, target) {
+            if (current === null) return target;
+            const diff = ((target - current + 540) % 360) - 180;
+            return (current + diff * 0.08 + 360) % 360;
+        }
+
+        function setupCompass() {
+            let isAbsoluteActive = false;
+
+            function handleOrientation(e) {
+                // If absolute events are available, prioritize them exclusively
+                if (e.type === 'deviceorientationabsolute' || e.absolute === true) {
+                    isAbsoluteActive = true;
+                } else if (isAbsoluteActive && e.type === 'deviceorientation') {
+                    return; // Ignore non-absolute events when absolute readings are active
+                }
+
+                let rawHeading = null;
+
+                // 1. iOS Safari hardware heading
+                if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+                    rawHeading = e.webkitCompassHeading;
+                } 
+                // 2. Android & W3C Absolute Magnetometer
+                else if (e.alpha !== null && e.beta !== null && e.gamma !== null) {
+                    rawHeading = calculateW3CCompassHeading(e.alpha, e.beta, e.gamma);
+                }
+
+                if (rawHeading === null || isNaN(rawHeading)) return;
+
+                const screenAngle = (window.screen && window.screen.orientation && window.screen.orientation.angle) || window.orientation || 0;
+                const correctedHeading = (rawHeading + screenAngle) % 360;
+
+                smoothedHeading = smoothHeadingAngle(smoothedHeading, correctedHeading);
+
+                const displayDelta = Math.abs(((smoothedHeading - (lastDisplayedHeading || 0) + 540) % 360) - 180);
+                if (lastDisplayedHeading === null || displayDelta >= HEADING_DEADBAND_DEG) {
+                    lastDisplayedHeading = smoothedHeading;
+
+                    if (waypoints && targetIdx < waypoints.length) {
+                        const target = waypoints[targetIdx];
+                        const targetBearing = getBearing(window.lastLat || target.lat, window.lastLng || target.lng, target.lat, target.lng);
+                        const diff = (targetBearing - smoothedHeading + 360) % 360;
+                        
+                        let advice = "";
+                        if (window.distToTurn <= 25) {
+                            if (diff >= 25 && diff < 155) advice = " (Quay sang phải)";
+                            else if (diff >= 155 && diff < 205) advice = " (Quay ngược lại)";
+                            else if (diff >= 205 && diff < 335) advice = " (Quay sang trái)";
+                        }
+
+                        document.getElementById("compassHeading").innerText = "Hướng bạn đang nhìn: " + Math.round(smoothedHeading) + "°" + advice;
+                    }
+                }
+            }
+
+            if ('ondeviceorientationabsolute' in window) {
+                window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+            }
+            if ('addEventListener' in window) {
+                window.addEventListener('deviceorientation', handleOrientation, true);
+            }
+        }
+
+        function startCameraDetection() {
+            const video = document.getElementById('mobileCam');
+            const canvas = document.getElementById('camCanvas');
+            const ctx = canvas.getContext('2d');
+
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: "environment", width: { ideal: 416 }, height: { ideal: 416 } } 
+                }).then(stream => {
+                    video.srcObject = stream;
+                    video.play();
+                    document.getElementById("trafficLightStatus").innerText = "🚦 Camera đã bật - Đang quét đèn...";
+
+                    setInterval(() => {
+                        const now = Date.now();
+                        
+                        if (!navActive || video.readyState !== 4 || isDetecting || (now - lastFrameTime < DETECTION_INTERVAL_MS)) return;
+                        
+                        isDetecting = true;
+                        lastFrameTime = now;
+
+                        ctx.drawImage(video, 0, 0, 416, 416);
+                        const base64Img = canvas.toDataURL('image/jpeg', 0.6);
+
+                        const baseUrl = getApiBaseUrl();
+                        fetch(`${baseUrl}/detect`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ image: base64Img })
+                        })
+                        .then(res => res.json())
+                        .then(data => {
+                            const status = data.status;
+                            const statusElem = document.getElementById("trafficLightStatus");
+                            
+                            if (status) {
+                                const currentTime = Date.now();
+
+                                if (status === "stop, red light") {
+                                    statusElem.innerText = "🚦 ĐÈN ĐỎ - DỪNG LẠI";
+                                    statusElem.style.color = "#FF5252";
+                                    
+                                    if (lastSpokenLightStatus !== "Red" || (currentTime - lastStopLightSpokenTime > STOP_LIGHT_COOLDOWN_MS)) {
+                                        speak("Đèn đỏ, dừng lại", 'HIGH');
+                                        triggerHaptic([500, 200, 500]);
+                                        lastSpokenLightStatus = "Red";
+                                        lastStopLightSpokenTime = currentTime;
+                                    }
+                                } else if (status === "stop, yellow light") {
+                                    statusElem.innerText = "🚦 ĐÈN VÀNG - CHUẨN BỊ DỪNG";
+                                    statusElem.style.color = "#FFB300";
+
+                                    if (lastSpokenLightStatus !== "Yellow" || (currentTime - lastStopLightSpokenTime > STOP_LIGHT_COOLDOWN_MS)) {
+                                        speak("Đèn vàng, chuẩn bị dừng lại", 'HIGH');
+                                        triggerHaptic([300, 150, 300]);
+                                        lastSpokenLightStatus = "Yellow";
+                                        lastStopLightSpokenTime = currentTime;
+                                    }
+                                } else if (status === "go, green light") {
+                                    statusElem.innerText = "🚦 ĐÈN XANH - ĐƯỢC ĐI";
+                                    statusElem.style.color = "#00E676";
+
+                                    if (lastSpokenLightStatus === "Red" || lastSpokenLightStatus === "Yellow") {
+                                        speak("Đèn xanh, được đi tiếp", 'HIGH');
+                                        triggerHaptic(200);
+                                        lastSpokenLightStatus = "Green";
+                                        lastStopLightSpokenTime = 0;
+                                    }
+                                }
+                            } else {
+                                statusElem.innerText = "🚦 Không phát hiện đèn giao thông";
+                                statusElem.style.color = "#B0BEC5";
+                            }
+                        })
+                        .catch(err => {
+                            document.getElementById("trafficLightStatus").innerText = "🚦 Đang kết nối camera...";
+                        })
+                        .finally(() => {
+                            isDetecting = false;
+                        });
+                    }, 200);
+                }).catch(err => {
+                    document.getElementById("trafficLightStatus").innerText = "🚦 Cần cấp quyền mở Camera trong trình duyệt";
+                });
+            } else {
+                document.getElementById("trafficLightStatus").innerText = "🚦 Trình duyệt không hỗ trợ Camera";
+            }
+        }
+
+        async function fetchNewRoute(uLat, uLng) {
+            isRecalculating = true;
+            document.getElementById("navInstruction").innerText = "🔄 Đang tính lại tuyến đường mới...";
+            speak("Đang tính lại tuyến đường mới.", 'HIGH');
+            triggerHaptic([300, 100, 300]);
+
+            try {
+                const baseUrl = getApiBaseUrl();
+                const res = await fetch(`${baseUrl}/route/v1/foot/${uLng},${uLat};${destLng},${destLat}?overview=full&steps=true`);
+                const data = await res.json();
+                if (data.code === "Ok") {
+                    waypoints = data.routes[0].legs[0].steps.map((s, idx) => {
+                        const mType = s.maneuver.type;
+                        const modifier = s.maneuver.modifier || "";
+                        const rawName = (s.name || "").trim();
+                        const ref = (s.ref || "").trim();
+                        const streetLabel = rawName || ref || "con hẻm hoặc lối đi";
+                        let speechPhrase = "";
+
+                        if (mType === "depart") {
+                            speechPhrase = (rawName || ref) ? `Bắt đầu đi thẳng về phía trước trên ${streetLabel}` : "Bắt đầu di chuyển thẳng theo lối đi hiện tại";
+                        } else if (mType === "arrive") {
+                            speechPhrase = "Bạn đã đến điểm đến ngay phía trước!";
+                        } else {
+                            const turnDir = translationMap[modifier] || "đi thẳng tiếp";
+                            speechPhrase = `${turnDir} vào ${streetLabel}`;
+                        }
+
+                        return {
+                            step: idx + 1,
+                            speech: speechPhrase,
+                            street: streetLabel,
+                            lat: s.maneuver.location[1], 
+                            lng: s.maneuver.location[0],
+                            m_type: mType
+                        };
+                    });
+                    
+                    targetIdx = waypoints.length > 1 ? 1 : 0;
+                    announcedSegment = false;
+                    announcedApproach = false;
+                    offRouteCount = 0;
+                    speak("Đã tìm thấy tuyến đường mới.", 'HIGH');
+                }
+            } catch (e) { console.error(e); } finally { isRecalculating = false; }
+        }
+
+        function processPosition(pos) {
+            if (!navActive || isRecalculating || !waypoints) return;
+            
+            const uLat = pos.coords.latitude, uLng = pos.coords.longitude;
+            window.lastLat = uLat; window.lastLng = uLng;
+
+            if (targetIdx >= waypoints.length) {
+                document.getElementById("navInstruction").innerText = "🎉 Bạn đã đến điểm đến!";
+                document.getElementById("navDistance").innerText = "";
+                return;
+            }
+
+            const target = waypoints[targetIdx];
+            const currentStreet = waypoints[targetIdx - 1] ? waypoints[targetIdx - 1].street : target.street;
+            const distToTurn = getHaversineDistance(uLat, uLng, target.lat, target.lng);
+            window.distToTurn = distToTurn;
+
+            let devDistance = targetIdx > 0 ? pDistance(uLat, uLng, waypoints[targetIdx - 1].lat, waypoints[targetIdx - 1].lng, target.lat, target.lng) : distToTurn;
+
+            if (devDistance > OFF_ROUTE_TOLERANCE_METERS) {
+                if (++offRouteCount === 1) {
+                    document.getElementById("navInstruction").innerText = "⚠️ Cảnh báo: Bạn đang đi chệch khỏi tuyến đường!";
+                    speak("Cảnh báo: Bạn đang đi chệch khỏi tuyến đường!", 'HIGH');
+                    triggerHaptic([300, 100, 300]);
+                }
+                if (offRouteCount >= OFF_ROUTE_TRIGGER_SAMPLES) { fetchNewRoute(uLat, uLng); return; }
+            } else offRouteCount = 0;
+
+            if (offRouteCount === 0) {
+                if (target.m_type === "arrive" && distToTurn <= 15) {
+                    document.getElementById("navInstruction").innerText = "🎉 Bạn đã đến điểm đến!";
+                    document.getElementById("navDistance").innerText = "";
+                    speak("Bạn đã đến điểm đến ngay phía trước!", 'HIGH');
+                    triggerHaptic([200, 100, 200, 100, 500]);
+                    targetIdx = waypoints.length;
+                    return;
+                } else if (distToTurn <= 15) {
+                    document.getElementById("navInstruction").innerText = "📍 " + capitalize(target.speech);
+                    speak(target.speech, 'NORMAL');
+                    triggerHaptic(200);
+                    targetIdx++;
+                    announcedSegment = false;
+                    announcedApproach = false;
+                } else if (distToTurn <= 35) {
+                    document.getElementById("navInstruction").innerText = "⚠️ Chuẩn bị " + target.speech;
+                    document.getElementById("navDistance").innerText = "Khoảng cách đến điểm rẽ: " + Math.round(distToTurn) + "m";
+                    if (!announcedApproach) {
+                        speak("Chuẩn bị " + target.speech, 'NORMAL');
+                        triggerHaptic(150);
+                        announcedApproach = true;
+                    }
+                } else {
+                    const straightPhrase = (targetIdx === 1 ? waypoints[0].speech : ("Đi thẳng về phía trước trên " + currentStreet));
+                    document.getElementById("navInstruction").innerText = "🚶 " + straightPhrase;
+                    document.getElementById("navDistance").innerText = "Khoảng cách đến điểm rẽ: " + Math.round(distToTurn) + "m";
+                    if (!announcedSegment) {
+                        speak(straightPhrase, 'NORMAL');
+                        announcedSegment = true;
+                    }
+                }
+            }
+        }
+
+        function toggleNavigation() {
+            navActive = !navActive;
+            const btn = document.getElementById("btnToggle");
+            if (!navActive) { 
+                window.speechSynthesis.cancel(); 
+                if (watchId) navigator.geolocation.clearWatch(watchId); 
+                document.getElementById("navInstruction").innerText = "⏸ Đã tắt dẫn đường Voice"; 
+                btn.innerText = "▶ Bật Voice Dẫn Đường";
+                btn.style.backgroundColor = "#00E676";
+            } else { 
+                btn.innerText = "🛑 Tắt Voice Dẫn Đường";
+                btn.style.backgroundColor = "#FF4B4B";
+                if ("geolocation" in navigator) watchId = navigator.geolocation.watchPosition(processPosition, e => {}, { enableHighAccuracy: true, maximumAge: 1000, timeout: 5000 });
+            }
+        }
+
+        window.onload = autoStartNavigation;
+    </script>
+</body>
+</html>

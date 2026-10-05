@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamlit-pedestrian-nav"
+version = "0.1.0"
+description = "Embeddable real-time pedestrian navigation with computer vision for Streamlit"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "streamlit>=1.20.0",
+    "streamlit-folium>=0.11.0",
+    "streamlit-js-eval>=0.1.5",
+    "folium>=0.14.0",
+    "ultralytics>=8.0.0",
+    "opencv-python-headless>=4.5.0",
+    "geopy>=2.3.0",
+    "polyline>=2.0.0",
+    "requests>=2.28.0",
+    "numpy>=1.21.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+pedestrian_nav = ["models/*.pt", "templates/*.html", "speech_component/*.html"]
